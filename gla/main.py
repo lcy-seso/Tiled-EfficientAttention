@@ -9,7 +9,8 @@ if __name__ == "__main__":
     config = GLAConfig(d_model=hidden, n_head=num_head)
     print(config)
 
-    GLA = GatedLinearAttention(config).cuda().to(torch.bfloat16)
+    GLA = GatedLinearAttention(config,
+                               mode="fused_chunk").cuda().to(torch.bfloat16)
 
     x = torch.randn((batch, length, hidden),
                     dtype=torch.bfloat16,

@@ -10,6 +10,7 @@ from .utils import contiguous
 
 @triton.jit
 def fused_recurrent_gla_fwd_kernel(
+
         # B: batch_size, H: n_heads, T: seq_len, D: d_head
         q,  # query [B, H, L, D_head_K]
         k,  # key [B, H, L, D_head_K]
@@ -36,8 +37,7 @@ def fused_recurrent_gla_fwd_kernel(
         DV: tl.constexpr,  # D_head_V
         USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
         STORE_FINAL_STATE: tl.constexpr,  # whether to store final state
-        REVERSE: tl.
-    constexpr,  # whether to do autoregressive modeling in the reverse direction
+        REVERSE: tl.constexpr,
         USE_GK: tl.constexpr,  # whether to use gk
         USE_GV: tl.constexpr,  # whether to use gv
 ):
