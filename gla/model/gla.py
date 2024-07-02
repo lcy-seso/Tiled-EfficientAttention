@@ -42,18 +42,8 @@ class GatedLinearAttention(nn.Module):
                                        eps=1e-5,
                                        elementwise_affine=False)
 
-        self.post_init()
-
-    def post_init(self):
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=2**-2.5)
-        nn.init.xavier_uniform_(self.k_proj.weight, gain=2**-2.5)
-        if isinstance(self.k_gate, nn.Sequential):
-            nn.init.xavier_uniform_(self.k_gate[0].weight, gain=2**-2.5)
-            nn.init.xavier_uniform_(self.k_gate[1].weight, gain=2**-2.5)
-        else:
-            nn.init.xavier_uniform_(self.k_gate.weight, gain=2**-2.5)
-
     def forward(self, x, hidden_states=None):
+        # x has shape [batch, seq_len, hidden_dim]
         q = self.q_proj(x)
         k = self.k_proj(x) * self.scaling
         k_gate = self.k_gate(x)
@@ -62,6 +52,7 @@ class GatedLinearAttention(nn.Module):
 
         output, new_hidden_states = self.gated_linear_attention(
             q, k, v, k_gate, hidden_states=hidden_states)
+        pdb.set_trace()
         output = self.gate_fn(g) * output
         output = self.out_proj(output)
         return output, new_hidden_states
@@ -97,7 +88,6 @@ class GatedLinearAttention(nn.Module):
                                              gk,
                                              initial_state=hidden_states,
                                              output_final_state=True)
-
         o = self.group_norm(o)
         o = rearrange(o, 'b h l d -> b l (h d)')
         return o, new_hidden_states
