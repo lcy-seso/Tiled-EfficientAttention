@@ -52,7 +52,7 @@ class GatedLinearAttention(nn.Module):
 
         output, new_hidden_states = self.gated_linear_attention(
             q, k, v, k_gate, hidden_states=hidden_states)
-        pdb.set_trace()
+
         output = self.gate_fn(g) * output
         output = self.out_proj(output)
         return output, new_hidden_states
