@@ -110,6 +110,7 @@ def fused_chunk_gla_fwd_kernel(
             b_o = tl.dot(b_q.to(b_v.dtype),
                          b_h.to(b_v.dtype),
                          allow_tf32=False)
+            # tl.math.exp2(d_b)[:, None] --> [BK, 1]
             b_h = (b_h * tl.math.exp2(d_b)[:, None] +
                    tl.dot(b_k.to(b_v.dtype), b_v, allow_tf32=False))
         else:
@@ -167,7 +168,6 @@ def fwd_inner_chunk(
         (i_t * BT, i_k * BK),
         (BT, BK),  # block shape
         (1, 0))
-
     b_k = tl.load(p_k, boundary_check=(0, 1))
 
     p_g = tl.make_block_ptr(
@@ -177,7 +177,6 @@ def fwd_inner_chunk(
         (i_t * BT, i_k * BK),
         (BT, BK),  # block shape
         (1, 0))
-
     b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
 
     mask = (i_k * BK + tl.arange(0, BK)) < DK
@@ -348,7 +347,7 @@ class FusedChunkGLAFunction(torch.autograd.Function):
         A = A.sum(0)
         o2 = A @ v2
         o2 = rearrange(o2, 'b h n c d -> b h (n c) d')
-        # combine inner and inter
+        # combine inner and intra chunks
         o.add_(o2)
         ctx.save_for_backward(q, k, v, g_original, A, initial_state)
         ctx.CHECK = CHECK
