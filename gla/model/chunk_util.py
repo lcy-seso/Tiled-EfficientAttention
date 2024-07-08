@@ -56,7 +56,6 @@ def prepare_qg_kg(
 ):
     i_k, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     p_q = q + i_bh * s_qk_h + i_c * BT * DK + i_k * BK + tl.arange(0, BK)
-    p_g = g + i_bh * s_qk_h + i_c * BT * DK + i_k * BK + tl.arange(0, BK)
     p_k = k + i_bh * s_qk_h + i_c * BT * DK + i_k * BK + tl.arange(0, BK)
 
     # output
@@ -65,7 +64,7 @@ def prepare_qg_kg(
 
     mask = (i_k * BK + tl.arange(0, BK)) < DK
 
-    # cannot understand this??
+    p_g = g + i_bh * s_qk_h + i_c * BT * DK + i_k * BK + tl.arange(0, BK)
     last_decay = tl.load(g + i_bh * s_qk_h + (i_c * BT + BT - 1) * DK +
                          i_k * BK + tl.arange(0, BK))
 
@@ -73,10 +72,13 @@ def prepare_qg_kg(
         _q = tl.load(p_q, mask=mask, other=0)
         _k = tl.load(p_k, mask=mask, other=0)
         _g = tl.load(p_g, mask=mask, other=0).to(tl.float32)
+        
         _q *= tl.math.exp2(_g) * scale
         _k *= tl.math.exp2(last_decay - _g)
+        
         tl.store(p_kg, _k.to(p_kg.dtype.element_ty), mask=mask)
         tl.store(p_qg, _q.to(p_qg.dtype.element_ty), mask=mask)
+        
         p_q += DK
         p_g += DK
         p_k += DK
