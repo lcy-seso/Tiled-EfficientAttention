@@ -4,7 +4,7 @@
   - [Chunkwise Parallelism](#chunkwise-parallelism)
   - [一个例子](#一个例子)
 - [Gated Linear Attention Layer](#gated-linear-attention-layer)
-  - [模型设计方面的贡献](#模型设计方面的贡献)
+  - [GLA在模型设计方面的贡献](#gla在模型设计方面的贡献)
   - [Gated states的全并行形式](#gated-states的全并行形式)
 - [Chunked Fuse 的实现](#chunked-fuse-的实现)
   - [fwd\_decay\_cumsum](#fwd_decay_cumsum)
@@ -118,7 +118,17 @@ $$
 \end{aligned}
 $$
 
-上面提到一个块内部想要并行地得到整个块的输出，需要以二次方复杂度的方式计算当前块这个局部窗口内的输出$\mathbf{O}_{t}$，也就是上面公式的蓝色部分。我们继续用一个hello world的例子来理解一下上面第一个公式红色和蓝色的部分所做的事情。
+。因为外积计算先算$\mathbf{K}^T\mathbf{V}$得到状态，只能得到最后一个时间步的输出。一个长度为$C$的块计算输出$\mathbf{O}_{[C \times d_v]}$，需要以二次方复杂度的方式来计算当前块这个局部窗口内$C$个时间步的输出，也就是上面公式的蓝色部分。于是chunkwise 并行算法将整个计算过程分为两部分：
+
+1. 每一个块独立的计算出当然块的输出和<font color=red>每一块最后一个时刻的状态</font>。这一步是块间全并行方式，互相独立地完成，也就是上述公式的蓝色部分。
+1. 将每一块最后一个时刻的状态在块间进行传递，也就是上述公式的红色部分。
+
+到这里就会出现两种实现选择：
+
+1. 第一步以更大的并行性将所有的chunk独立进行计算（相当于用kernel并行地计算<font color="blue">上面公式中的蓝色部分，没有数据依赖</font>），每个分块计算出状态$S_i$；这时候状态会占一个较大的空间（$\frac{L}{C} \times d_k \times d_v$，$C$是分块的大小，<font color=blue>但应该比全并行方式存储$\mathbf{P}=\mathbf{K}\mathbf{V}$占据$L \times L$要小才会有明显的受益？</font>），存储回DRAM；第二步再用另外一个kernel，以parallel scan 方式利用序列级别的并行性，对状态进行累加，计算出最终的$O$ （相当于用parallel scan kernel计算上面公式的红色部分），或者串行累加解决空间；
+2. 为了避免将状态$S$存回DRAM，kernel内部在序列长度方向循环，在SRAM上计算出状态，对状态进行累加，这时候不会产生DRAM和SRAM之间的I/O，但是并行性会较小一些；
+
+我们继续用一个hello world的例子来理解一下上面第一个公式红色和蓝色的部分所做的事情。
 
 ## 一个例子
 
@@ -181,11 +191,6 @@ Fig 1. 以先算KV视角理解linear attention的含义
 
 chunk之间沿着序列长度方向对状态$S_t$进行累积，在序列长度方向的parallel scan（下面公式的红色部分），chunk之内以全并行或者recurrent 方式进行计算。
 
-到这里就会出现两种实现选择：
-
-1. 以更大的并行性将所有的chunk独立进行计算（相当于用kernel并行地计算<font color="blue">上面公式中的蓝色部分，没有数据依赖</font>），每个分块计算出状态$S_i$；这时候状态会占一个较大的空间（$\frac{L}{C} \times d_k \times d_v$，$C$是分块的大小），存储回DRAM；然后可以再用另外一个kernel，以parallel scan 方式利用序列级别的并行性，对状态进行累加，计算出最终的$O$ （相当于用parallel scan kernel计算上面公式的红色部分）；
-2. 为了避免将状态$S$存回DRAM，kernel内部在序列长度方向循环，在SRAM上计算出状态，对状态进行累加，这时候不会产生DRAM和SRAM之间的I/O，但是并行性会较小一些；
-
 # Gated Linear Attention Layer
 
 Gated Linear Attention在linear attention的基础上加上input-dependent的门控，对状态进行衰减，也就是引入了下图红色的$G$矩阵。$\textcolor{red}{G_t}$是一个$d_k\times d_v$大小的矩阵，并且依赖于输入。
@@ -197,9 +202,21 @@ S_t &= \textcolor{red}{G_t} \odot S_{t-1} + k_t^T v_t & [d_k, d_v] &=\textcolor{
 \end{aligned}
 $$
 
-## 模型设计方面的贡献
+我们把GLA看做是一个RNN layer（causal形式，不attend到未来时刻，$i$时刻只去attend $i$时刻之前）由以下计算得到：
 
-如果通过full rank的方法得到$G_t$，那么需要$d_k \times d_k \times d_v$大小的映射矩阵，需要学习的参数会非常多；GLA通过以下2个技巧让模型是parameter-efficient：
+$$
+\begin{aligned}
+&\text{for} \ \ t \in \left[0, L - 1 \right) \\
+&\qquad s_t = s_{t - 1} * g_{t} + k_t \otimes v_t &&\qquad \text{\footnotesize{// 对状态进行衰减，与当前时刻状态相加}} \\
+&\qquad o_t = \gamma * q_t * s_t &&\qquad \text{\footnotesize{// gemv操作}} \\
+\end{aligned}
+$$
+
+<!-- 和MHA相比，linear attention独特之处在于如果以recurrent模型进行计算，一个for循环就可以算出来最终的输出，这个是算法层面地对计算量和存储需求的巨大改善。缺点是串行计算时无法利用tensor core。 -->
+
+## GLA在模型设计方面的贡献
+
+如果通过full rank的方法得到$G_t$，那么需要$d_k \times d_k \times d_v$大小的映射矩阵，需要学习的参数会非常多；GLA通过以下2个技巧解决parameter-efficiency问题：
 
 1. 第一，通过一个低秩方法得到整个序列长度级别的gating factors矩阵：$$G=\text{sigmoid}\left( (x_{[1,d_k]}\textcolor{blue}{W}^1_{[d_k,d_1]}) \textcolor{blue}{W}^2_{[d_1, d_k]} \right)$$
 
@@ -212,7 +229,7 @@ $$
 下面四行公式是gated linear attention layer在算法设计上得到的最终模型，公式（8）和（9）是linear attention部分，(10）和（11）是normalization和类似于输出门。
 
 <p align="center">
-<img src="figures/gla_equation.png" width=70%><br>
+<img src="figures/gla_equation.png" width=90%><br>
 Fig 3. GLA layer以recurrent模式单步计算的线性代数公式<br>
 </p>
 
@@ -233,21 +250,9 @@ Fig 3. GLA layer的数据流依赖
 
 2. $\text{silu}(x) = x * \text{sigmoid}(x)$
 
-我们把GLA看做是一个RNN layer（causal形式，不attend到未来时刻，$i$时刻只去attend $i$时刻之前）由以下计算得到：
-
-$$
-\begin{aligned}
-&\text{for} \ \ t \in \left[0, L - 1 \right) \\
-&\qquad s_t = s_{t - 1} * \exp(gk_{t}) + k_t \otimes v_t &&\qquad \text{\footnotesize{// 对状态进行衰减，与当前时刻状态相加}} \\
-&\qquad o_t = \text{sum}\left(\gamma * q_t * h_t, \text{dim}=-2\right) &&\qquad \text{\footnotesize{// 对2D状态进行reduce压缩到1D}} \\
-\end{aligned}
-$$
-
-和MHA相比，linear attention独特之处在于如果以recurrent模型进行计算，一个for循环就可以算出来最终的输出，这个是算法层面地对计算量和存储需求的巨大改善。缺点是无法利用tensor core。
-
 ## Gated states的全并行形式
 
-引入$\textcolor{red}{G_t}$对状态$S_{t}$进行衰减之后，我们很容易发现上面的chunk-wise并行方式需要重新进行推导。为了得到全并行方式（或者判断一个递推式是否存在某种等价的高效全并行实现形式），我们将递推公式：$S_t = G_t \odot S_{t-1} + k_t^Tv_t$进行unroll展开，我们可以得到：
+当引入$\textcolor{red}{G_t}$对状态$S_{t}$进行衰减之后，我们很容易发现上面的chunk-wise并行方式需要重新进行推导。为了得到全并行方式（或者判断一个递推式是否存在某种等价的高效全并行实现形式），我们将递推公式：$S_t = G_t \odot S_{t-1} + k_t^Tv_t$进行unroll展开，于是会得到：
 
 $$
 \begin{aligned}
@@ -261,9 +266,7 @@ S_3 &= G_3 \odot S_2 + k_3^Tv_3 \\
 \end{aligned}
 $$
 
-注意观察上面的公式，假设当前时刻为$t$，从$1$到$t$时刻的gating factor全部都会作用于$S_0$，对$S_0$进行衰减，也就是说距离当前时刻越远的状态对$t$时刻的影响越小。
-
-当我们不以recurrent递归式的方式进行计算，假设每个时间步都从0时刻开始运算，会得到以下展开的$S_t$计算公式。上文提到过，在GLA中为了以parameter-efficient的方式得到$G_t$（大小$d_k \times d_v$），$G_t$来自于向量$\alpha_t$（大小$1\times d_k$），即：$G_t = \left(\alpha^T_t \mathbf{1}\right)$（这里$\mathbf{1}$的大小为$1 \times d_v$），带入$G_t$的这个具体形式于是有：
+注意观察上面的公式，假设当前时刻为$t$，从$1$到$t$时刻的gating factor全部都会作用于$S_0$，对$S_0$进行衰减，也就是说<font color=red>距离当前时刻越远的状态对$t$时刻的影响越小</font>。假设在计算每个时间步的输出$o_t$时，总是从0时刻开始运算，于是我们会得到以下展开的$S_t$计算公式。同时，上文提到在GLA这个模型中，处于效率方面的考虑$G_t$这个衰减矩阵来自于对向量$\alpha_t$（大小$1\times d_k$）的扩展运算，即：$G_t = \left(\alpha^T_t \mathbf{1}\right)$（这里$\mathbf{1}$的大小为$1 \times d_v$），将$G_t$的这个具体形式一并带入unrolled 的$S_t$计算公式，于是有：
 
 $$
 \begin{aligned}
@@ -276,30 +279,36 @@ $$
 
 $$
 \begin{aligned}
-S_t = \sum_{i=1}^{t} \left( \left( \frac{b_t}{b_i} \right)^T\mathbf{1} \right) \odot k_i^Tv_i
+S_t &= \sum_{i=1}^{t} \left( \left( \frac{b_t}{b_i} \right)^T\mathbf{1} \right) \odot k_i^Tv_i \\
+&=\sum_{i=1}^{t} \left(\left( \frac{b_t}{b_i}\right)k_i \right)^Tv_i
 \end{aligned}
 $$
+
+一旦采用了外积视角通过矩阵乘先计算了$\mathbf{K}^T \mathbf{V}$，得到的是到当前时刻的累加状态，而不能得到所有时刻的输出。<font color=red>公式$\mathbf{S}_t$得到了是chunk-wise算法中到$t$时刻为止的状态，这与上文讨论的非gating的chunk-wise并行计算方式是一致的，我们还需要一个能够的得到每个时间步输出的块内全并行计算</font>。
 
 $o_t = q_tS_t$，于是有：
 
 $$
 \begin{aligned}
 o_t &= q_t\sum_{i=1}^{t} \left( \left( \frac{b_t}{b_i} \right)^T\mathbf{1} \right) \odot k_i^Tv_i \\
-&=\sum_{i=1}^{t} \left(q_t \odot b_t \right) \left( \frac{k_i}{b_i}\right)^Tv_i
+&=\sum_{i=1}^{t} \left(q_t \odot b_t \right) \left( \frac{k_i}{b_i}\right)^Tv_i \\
+&=\left(q_t \odot b_t \right) \sum_{i=1}^{t} \textcolor{blue}{\left( \frac{k_i}{b_i} \right)^Tv_i}
 \end{aligned}
 $$
 
-经过这个公式变形地转化，gating factor同时作用于$q_t$和$k_i$。令$B\in (0,1)^{L \times d}$，是将$b_i^T$（$i=0,\dots ,L$）进行stack，将上面的公式写成矩阵化的形式：
+gating factor同时作用于$q_t$和$k_i$。将$b_i^T$（$i=0,\dots ,L$）进行stack，记作$\mathbf{B}\in (0,1)^{L \times d}$。将上面的公式写成矩阵化的形式：
 
 $$
 \begin{aligned}
-\mathbf{O} = \left( \left(\mathbf{Q} \odot \mathbf{B}\right) \left( \frac{\mathbf{K}}{\mathbf{B}} \right)^T \odot \mathbf{M} \right) \mathbf{V}
+\mathbf{O} &= \left( \left(\mathbf{Q} \odot \mathbf{B}\right) \left( \frac{\mathbf{K}}{\mathbf{B}} \right)^T \odot \mathbf{M} \right) \mathbf{V}
 \end{aligned}
 $$
 
-公式中每一个操作数的形状为：$[C, d_v]=[C, d_k]\odot [C, d_k] \left( \frac{[C, d_k]}{[C, d_k]}\right)^T[C, d_v]$，上式就是GLA的全并行公式，如果我们能够提前对$\mathbf{Q}$和$\mathbf{K}$进行衰减得到$\widetilde{\mathbf{Q}}=\mathbf{Q}\odot \mathbf{B}$及$\widetilde{\mathbf{K}}=\frac{\mathbf{K}}{\mathbf{B}}$，那么$\widetilde{\mathbf{Q}}\tilde{\mathbf{K}}^T$依然可以利用矩阵乘完成。但是$\mathbf{B}$是一个对$(0,1)$之间浮点数沿着序列长度方向上的连乘，随着序列长度增加数值会无限趋近于0，<font color=red>导致计算$\frac{\mathbf{K}}{\mathbf{B}}$是数值不稳定的</font>。为了让数值计算稳定，$\mathbf{P} \triangleq \left( \mathbf{Q} \odot \mathbf{B}\right) \left(\frac{\mathbf{K}}{\mathbf{B}}\right)^T$，将计算转换到对数空间，将得到$\mathbf{B}$的连乘变成对数空间的连加，然后再通过$\exp$操作转换回来原空间，于是有：
+公式中每一个操作数的形状为：$[C, d_v]=[C, d_k]\odot [C, d_k] \left( \frac{[C, d_k]}{[C, d_k]}\right)^T[C, d_v]$，上式就是GLA的全并行公式。如果能够提前对$\mathbf{Q}$和$\mathbf{K}$进行衰减得到$\widetilde{\mathbf{Q}}=\mathbf{Q}\odot \mathbf{B}$及$\widetilde{\mathbf{K}}=\frac{\mathbf{K}}{\mathbf{B}}$，那么$\widetilde{\mathbf{Q}}\tilde{\mathbf{K}}^T$依然可以利用矩阵乘完成。
 
-$$\mathbf{P}_{ij}=\sum_{k=1}^{d_k} \mathbf{Q}_{i,k} \mathbf{K}_{j,k} \exp\left( \log \left(\mathbf{B}_{i,k}\right) - \log \left(\mathbf{B}_{j,k} \right)\right)$$
+但是$\mathbf{B}$是一个对$(0,1)$之间浮点数沿着序列长度方向上的连乘，随着序列长度增加数值会无限趋近于0，<font color=red>导致计算$\frac{\mathbf{K}}{\mathbf{B}}$是数值不稳定的</font>。为了让数值计算稳定，$\mathbf{P} \triangleq \left( \mathbf{Q} \odot \mathbf{B}\right) \left(\frac{\mathbf{K}}{\mathbf{B}}\right)^T \odot \mathbf{M}$，将计算转换到对数空间，将得到$\mathbf{B}$的连乘变成对数空间的连加，然后再通过$\exp$操作转换回来原空间，于是有：
+
+$$\mathbf{P}_{ij}=\sum_{k=1}^{d_k} \mathbf{Q}_{i,k} \mathbf{K}_{j,k} \exp\left( \log \left(\mathbf{B}_{i,k}\right) - \log \left(\mathbf{B}_{j,k} \right)\right),\qquad i \ge j$$
 
 这个公式的计算pattern和矩阵乘一样，如下图所示。上式中的连加符号就是在矩阵乘的$K$维度进行reduce，但是可以注意由于$A$，$B$操作数（沿用矩阵乘的namning convention）需要首先和gating factor进行element-wise运算（<font color=red>为了使用tensor core，实现的时候会对$Q$和$K$预先完成与gating</font>）。
 
@@ -371,7 +380,7 @@ $$f(\vec{s},\vec{x}) = \vec{s} + \vec{x} / \ln 2 $$
 以$Q$，$K$，$V$和$G$为输入，以和$Q$，$K$等大的$Q_g$和$K_g$为输出，给$Q$和$K$都乘以gating factor $G$，进行衰减。这个kernel完成的数学计算如下（实现中需要先对$g$计算2的幂运算，将映射到对数空间的gating factor进行还原得到sigmoid的输出，下面的公式省略了这个2的幂运算)：
 
 $\qquad q_i = q_i * g_i * \gamma$
-$\qquad k_i = k_i * (\text{last\_decay} - g_i)$  <font color=red>$\qquad \leftarrow$ 这里为什么是 $\text{last\_decay}-g_i$</font>?
+$\qquad k_i = k_i * (\text{last\_decay} - g_i)$
 
 ```python
 load(last_decay)
@@ -403,7 +412,7 @@ last_decay = tl.load(g + i_bh * s_qk_h + (i_c * BT + BT - 1) * DK + i_k * BK
 
 ## fused_chunk_gla_fwd_kernel
 
-这个kernel的分数据方案如下，<font color="red">这个公式的内部以recurrent模式计算linear attention，每个块是相互独立的，只有这个kernel里面的运算使用到了tensor core</font>。
+这个kernel完成了在整个序列长度上累积状态，本质上是一个parallel scan过程。这个kernel的分数据方案如下，<font color="red">这个公式的内部以recurrent模式计算linear attention，每个块是相互独立的，只有这个kernel里面的运算使用到了tensor core</font>。
 
 <p align="center">
 <img src="figures/fused_chunk_gla_fwd_kernel.png" width=50%><br>
